@@ -1,0 +1,100 @@
+# `from_prompt` Design Sketch - Multi-Step Refiner
+
+**Status:** design sketch, not committed, not scoped for effort/timeline. Origin: Sandra's 2026-07-13 worked example ("Falling Water Villa living room" -> North by Northwest's Vandamm House / Fallingwater). Not a build brief - promote to one when this is actually queued.
+
+**CORRECTION 2026-07-14 (Sandra: "comfyops is untested") - this changes the whole design's prerequisites:** every reference below to comfyops-mcp's Wan stack as "already exists" or "already in the fleet" assumed a working installation. Checked directly on Goliath: **ComfyUI itself is not installed anywhere** (`D:\ComfyUI` doesn't exist, no override configured, no process running, no directory found on either drive), and the model directory (`D:\models\comfyui\`) doesn't exist either. comfyops-mcp is a real, well-built FastMCP server shell with zero working generation capability behind it right now - it wraps a ComfyUI installation that was never actually done. Additionally, the original build brief's `comfy_models.download` op (automated HF hub model fetching) was never implemented, so even once ComfyUI is installed, populating the models directory is still a manual step. **Every stage below that depends on comfyops-mcp (stages 4 and 5) is blocked on real installation work, not just "pick which model to use."** This doesn't kill the design - it moves "install ComfyUI + pull Wan weights" to the front of the prerequisite list, ahead of anything else in this doc.
+
+## Why the worked example matters
+
+The Vandamm House (North by Northwest, 1959) is fictional - production designer Robert Boyle modeled it *after* Fallingwater, but it was never a real, fully-designed building. It existed only as a partial MGM soundstage set plus a matte painting for exterior shots. This means:
+
+- No complete floorplan of "the movie house" exists - only Fallingwater's real, published floorplans (Frank Lloyd Wright Conservancy), and whatever interior stills survive from the scenes actually filmed.
+- A prompt like this is genuinely ambiguous, not a corner case: real Fallingwater vs. cinematic Vandamm interior (partial) vs. a deliberate blend are three different, valid answers depending on what the person meant.
+- **This is the normal shape of an evocative architectural prompt, not an edge case.** Any `from_prompt` design has to treat disambiguation as stage one, not skip straight to generation.
+
+## Proposed pipeline
+
+```
+Prompt ("falling water villa living room, like north by northwest")
+   |
+   v
+1. DISAMBIGUATION (Ollama, structured output)
+   Resolve real-world referent(s). May need to ask a clarifying question
+   rather than guess (real building? fictional depiction? blend?) -
+   silently picking one is worse than asking once.
+   |
+   v
+2. GROUNDING SEARCH (parallel, tool-assisted)
+   - plex-mcp: does the referenced film exist in the library? pull stills
+     from the specific scenes that match (interior, not exterior matte
+     shots that don't correspond to any real room)
+   - web search: real building's published floorplans/archival photos if
+     the referent is (partly) real (Fallingwater Conservancy, etc.)
+   |
+   v
+3. SCENE SPEC (Ollama, structured Pydantic schema)
+   Style, materials, lighting, spatial layout - grounded in stage 2's
+   references, not free-floating hallucination.
+   |
+   v
+4. HERO IMAGE (comfyops-mcp, i2i/t2i)
+   One reference-grounded still.
+   |
+   v
+5. CAMERA-PATH WALKTHROUGH VIDEO (pluggable backend - see below)
+   NOT independently-generated stills from "different angles" - see
+   technical risk note below. A single video generation with camera-path
+   conditioning maintains geometric consistency across frames the way
+   independent still generations don't.
+   |
+   v
+6. EXISTING PIPELINE (splat_generate operation="from_video")
+   No new splat-side capability needed - the generated video feeds
+   straight into the already-built ns-process-data -> ns-train ->
+   ns-export chain exactly as a real phone video would.
+```
+
+**The load-bearing design insight: stages 1-5 are new, stage 6 is not.** Roughly 90% of the splat-generation infrastructure this needs already exists in the fleet (comfyops-mcp, plex-mcp, the already-built video pipeline) - `from_prompt` is a *composition* problem, not a new engine problem.
+
+## Technical risk, flagged honestly
+
+Multiple independently-generated still images of "the same room from different angles" have **no geometric consistency guarantee** - there's nothing forcing two separate diffusion generations to agree on where the fireplace is. Feed that into `ns-process-data images` and COLMAP's feature-matching/SfM step will likely fail outright, or worse, silently produce a corrupted pose estimate. This is why stage 5 specifies a **single video generation with camera-path conditioning**, not N independent stills - video diffusion models model temporal/spatial consistency across frames in a way independent generations don't. Needs to be verified against the actual chosen backend before committing to this design - flagged as unverified, not assumed.
+
+## Stage 5 backend choice: comfyops vs. Veo 3 (2026-07-13, Sandra)
+
+Worth naming honestly rather than defaulting past it: Google's Veo 3 is a genuinely stronger video model in general terms, and might handle multi-view consistency better than the fleet's local options. Real numbers before deciding anything:
+
+- **Cost, verified against Google's Gemini API pricing table (checked 2026-07-13):** $0.40-$0.75/second depending on variant (Fast vs Standard), audio adds ~50%. An 8-second clip runs **$3.20-$6.00 per generation** on the direct API. This is not a rounding error - it reintroduces the exact "paid cloud API" cost problem this whole repo exists to route around, just relocated from World Labs to Google.
+- **8-second cap per generation** is the sharper technical issue. A real photogrammetry-quality walkthrough usually wants far more coverage than 8 seconds. Chaining multiple generations is possible (Veo 3.1 has an "Extend" endpoint), but unless Extend preserves *rigid geometric continuity* - not just visual/stylistic continuity - across the cut, chaining could introduce a worse consistency break than a single comfyops i2v generation: the room's geometry could subtly drift between chained clips, which is exactly the failure mode that breaks COLMAP.
+- **Whether Veo 3 is actually better at the thing that matters - rigid multi-view consistency usable for photogrammetry, not just "looks physically plausible" - is unverified in either direction.** Real evidence found: Veo 3 is marketed on physics/world consistency in general terms. No evidence found either way on photogrammetric reconstruction specifically, for Veo 3 or for the fleet's local models.
+
+**Recommendation: make stage 5 pluggable, not a committed choice.** Same registry-style thinking as DeepSeek's `SplatBackend` suggestion, one layer up - a `VideoGenBackend` interface with comfyops as the default (free, local, fits the project's entire cost thesis, zero marginal cost per test) and Veo 3 as an opt-in paid alternative for comparison testing. Try comfyops first; if COLMAP genuinely can't reconstruct clean geometry from it, that's the moment to spend real money on one Veo 3 test generation - not the default starting point.
+
+**Update 2026-07-13 (later), checked what's actually current:**
+
+- Veo 3.1 still caps at 4-8s per raw generation, but "Scene Extension" now chains up to 20 times using the real last frame as the seed for the next segment, reaching ~148s. A genuinely stronger continuity mechanism than blind chaining - but frame-to-frame visual continuity is not the same guarantee as rigid 3D geometric consistency across the chain. Untested for this use case either way.
+- Wan 2.2 (comfyops-mcp's stack, per FLEET_INDEX and its own model roster doc - NOT verified installed, see correction at top of this doc) caps similarly, ~5s/120 frames per generation - free does not mean unconstrained, don't assume it's automatically better than Veo on duration.
+- **Wan 2.7** (newer, still Apache-2.0, still open-weights, still free/self-hostable) has first/last-frame conditioning like Veo's Scene Extension, plus a "9-grid" mode: photograph a subject from nine angles, generates a rotation video claimed to have "accurate 3D form." This is the single most directly relevant feature found for this problem - explicitly aimed at multi-view 3D consistency, not just cinematic plausibility. Worth testing empirically (marketing claims about "accurate 3D form" are not verification), and worth checking whether comfyops-mcp's current model roster includes 2.7 or only 2.2 before assuming it's already available.
+- Kling 3.0 (Kuaishou) is the strongest Chinese *paid* alternative if a paid comparison is ever warranted - shipped native 4K Feb 2026, ahead of Veo 3.1 on raw resolution. Distinct from Wan, which is Chinese-origin but free/self-hosted.
+
+**Revised sequencing:** test Wan 2.7's 9-grid/first-last-frame features first (free, already closer in stated purpose to this exact problem than general cinematic models). Only reach for a paid API - Veo or Kling - if that specific test fails, and compare both rather than defaulting to Veo alone.
+
+**RTX 4090 compatibility, checked 2026-07-14:** very likely yes, but no hard confirmed VRAM numbers found for Wan 2.7 specifically - one current source states the 4090 "is worth it only if you need Wan 2.7," which only makes sense if it runs there, and indirect evidence supports it (2.7 keeps native resolution at 1080p, same tier as 2.2's 14B; still Apache 2.0 open-weights; Wan's community quantization ecosystem - FP8 ~15GB, GGUF Q4/Q8 - has shown up within days of every prior release). For calibration, 2.2's 14B confirmed numbers: full FP16 needs 54-65GB (out of reach even for a 5090), but FP8 + T5 offload gets 720p clips on a 4090 in 2-4 minutes. Not a hardware blocker either way - the real open question is whether comfyops-mcp's current model roster has 2.7 (or its quantized weights) downloaded yet, which was already flagged as an open question above.
+
+**Wan 2.1 vs 2.7, real comparison done 2026-07-14 (what's actually installed via Pinokio reuse is 2.1, not 2.7):** the version gap matters more than "generally better" here - two specific 2.7 features change the pipeline design, not just the quality bar. (1) **Video-extend** - 2.7 can produce a real continuation of an existing clip, not just an independent re-generation. Wan 2.1 has no equivalent. This directly addresses the technical-risk section's core unverified worry (chained clips drifting geometrically) the same way Veo 3's Scene Extension does, at zero API cost. (2) **Reference-driven generation** - 2.7 accepts images/video/audio as reference material with multi-subject scenarios, not just a text prompt. The disambiguation stage (§1) currently pulls grounding material (Plex stills, real floorplans) only to inform an LLM-composed *text* prompt, because that was the only lever under 2.1-era assumptions - 2.7 could take those grounding images as direct reference input instead, a materially better architecture for exactly the Fallingwater/Vandamm-House disambiguation case. Real tradeoff, not a strict upgrade: 2.7 continues 2.2's MoE architecture, which broke the 2.1 LoRA ecosystem - if community LoRAs for character/style consistency ever matter, keep 2.1 available alongside 2.7 rather than retiring it. **Action item: the free Pinokio-reuse win got us 2.1; getting 2.7 needs a real download (not found elsewhere in the Pinokio inventory), worth doing given how much of the design 2.7's features actually solve.**
+
+**Two more candidates found 2026-07-14, via Pinokio inventory (see `mcd architecture/PINOKIO_INVENTORY.md`):**
+
+- **`ml-sharp-pinokio.git`** - a local, one-click single-image-to-3D-Gaussian-splat tool, already installed (7.7GB), completely separate approach from everything else discussed here. Doesn't need a video-generation stage at all - if it produces a usable splat directly from the hero image (stage 4), stages 5-6 (video generation + photogrammetry) could be skipped entirely for some use cases. Not evaluated yet - genuinely different enough from the video-gen-then-photogrammetry approach that it deserves its own comparison, not just folded into the stage-5 backend choice.
+- **`lingbot-world-pinokio.git`** - a purpose-built "world model" for image-to-video (183GB, 4-bit quantized, ~20GB VRAM), a different category from general video diffusion (Wan/Veo/comfyops). "World model" training implies spatial/physical consistency as an explicit objective, which is exactly the untested property every other stage-5 candidate has been flagged as uncertain on. Worth testing before finalizing the Wan-2.7-vs-Veo-3 comparison - might solve the actual problem (multi-view consistency for COLMAP) better than either.
+
+## Copyright/usage scope
+
+Pulling stills from a copyrighted film (via plex-mcp, from Sandra's own library) as private, local, non-distributed creative/compositional reference is a materially different thing from reproducing or distributing copyrighted material. This design is scoped to **personal, local, non-published use** - generating a splat of your own home inspired by a film you own, kept on your own infrastructure. That scope should stay explicit if this ever gets built, not left implicit.
+
+## Open questions before this could be scoped as a real build brief
+
+1. Does the disambiguation stage ask a clarifying question, or pick a default and say what it picked? (Lean toward: ask once if genuinely ambiguous, default-and-announce otherwise - matches the fleet's general proactivity doctrine.)
+2. Does comfyops-mcp's i2v actually maintain enough multi-view consistency for COLMAP to succeed, or does this need a different generation approach entirely (Veo 3 or otherwise)? Needs a real test, not an assumption.
+3. Where does the Pydantic scene-spec schema live - splatmaker-mcp itself, or a shared fleet schema other creative-chain tools could reuse (worldlabs-adjacent chains, per the deep analysis doc's artistic chain)?
+4. If Veo 3 is ever wired as an opt-in backend, does it go through a proper `veo-mcp`-style fleet server, or a direct API call from splatmaker-mcp itself? Fleet convention favors the former (per FLEET_INDEX's pattern of one server per external API surface) - check if one already exists before building a second.

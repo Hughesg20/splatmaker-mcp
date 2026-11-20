@@ -1,0 +1,63 @@
+# splatmaker-mcp (full reference)
+
+## Purpose
+
+Self-hosted, zero-marginal-cost Gaussian-splat generation, wrapping one of several candidate FOSS engines (Postshot CLI, gsplat, Nerfstudio-derived pipelines - none chosen yet). Built as the cost-conscious alternative to worldlabs-mcp's Marble API for the same downstream chain: photo/video capture -> navigable 3D splat world -> blender-mcp finishing -> resonite-mcp / Resonite or VRChat world import.
+
+## Status honesty
+
+This is v0.4.0. What is real: the FastMCP 3.2+ server, dual transport (stdio for Claude Desktop/Cursor, streamable HTTP on /mcp for the webapp and fleet hub), the splat_generate portmanteau tool's full schema and SQLite-backed job tracking, the splat_engine_status introspection tool, the server_shutdown tool (matches POST /api/shutdown), the /api/health, /api/status, /api/capabilities, /api/jobs endpoints plus POST /api/jobs/status, the webapp (Dashboard, Generate, Jobs), CORS per fleet standard with a same-origin webapp, and a passing test suite (8 tests).
+
+What is not yet real: a full end-to-end training run against real capture data (needs Sandra's own photos/video of a real space - Nerfstudio's demo datasets are blocked by an external Google permission issue). No MCPB bundle yet. No Chat/Skills/Help/Logs webapp pages yet.
+
+## Tool reference
+
+### splat_generate(operation, video_path=None, image_paths=None, job_id=None)
+
+Portmanteau tool. operation is one of:
+- from_video: start a job from a local video file path. Requires video_path. Returns {job_id, status, message}. status will be "not_implemented" until an engine is wired.
+- from_images: start a job from a list of local image file paths. Requires image_paths. Same return shape as from_video.
+- status: check a job's current status. Requires job_id. Returns {job_id, status, message}.
+- list: list all known jobs (in-memory, this process's lifetime only). Returns {jobs: [{job_id, status, kind}, ...]}.
+- get_asset: return the asset paths for a completed job. Requires job_id. Errors if the job is not in "done" status.
+
+### splat_engine_status()
+
+No arguments. Returns {success, engine, configured, verified, engine_version, engine_error, max_iterations, note, message} describing which engine (if any) is set, whether the real nerfstudio CLI is present (`uv sync --extra engine`), and the cached `ns-train --help` truth (verified ok/broken/missing/pending).
+
+### server_shutdown()
+
+No arguments. Returns {success, status, message}. Matches POST /api/shutdown - both call the same underlying implementation (exit ~0.5s after responding).
+
+### show_status_card()
+
+No arguments. `@mcp.tool(app=True)` Prefab card with engine state + job counts by status; plain-text content mirrors the card for text-only hosts.
+
+## REST endpoints (backend :11091)
+
+- GET /api/health - liveness probe {status, server, version, uptime_seconds, engine_configured}
+- GET /api/status - richer status (tool_count, tools, job_count, jobs_by_status)
+- GET /api/capabilities - tool catalog + REST route list + ports
+- GET /api/jobs - all jobs with kind/status/message
+- POST /api/jobs/status {job_id} - one job's status/message
+- GET /api/skills - splat_workflow prompt text + resource descriptor
+- GET /api/logs - in-memory log ring (?limit, max 500)
+- GET /api/llm/models - completion-capable local Ollama models
+- POST /api/llm/chat {model, messages, system?} - Ollama chat passthrough (non-streaming)
+- POST /api/shutdown - orderly exit (200 immediately, process exits ~500ms later)
+
+CORS: explicit origins (dev frontend :11092, Tauri schemes) + LAN/Tailscale regex. Webapp uses same-origin /api via the vite proxy; absolute backend URL only inside Tauri.
+
+## Critical downstream integration note: no collision mesh
+
+Unlike worldlabs-mcp, which returns assets.mesh.collider_mesh_url (a GLB collision mesh) alongside every generated splat, this server's output has no collision geometry. Any consumer - blender-mcp import, direct Resonite/VRChat world import - MUST route the raw splat through blender-mcp's blender_splatting tool (import, generate collision mesh, export) before the result is usable as a walkable VR space. Skipping this step produces a splat that looks correct in every screenshot and has no floor, walls, or furniture collision once someone is actually standing in it. This exact class of mistake was made once already in fleet documentation for worldlabs-mcp (in the opposite direction - assuming Blender needed to compute a collision mesh that worldlabs already provided) - see mcp-central-docs/architecture/FLEET_DEEP_ANALYSIS_2026-07-13.md section 2.2.1 for the full history. Do not repeat it here in the other direction.
+
+## Fleet position
+
+Registered in mcp-central-docs/operations/WEBAPP_PORTS.md (ports 11091/11092). Registers with mcp-federation-hub on HTTP-transport startup per the three-layer orchestration hierarchy (mcp-central-docs/architecture/ORCHESTRATION_HIERARCHY.md) - this server is a Layer 3 domain node, not a registry or a client of Fritz. Cataloged as a "medium" tier gestating chain (not yet promoted to a full build brief) in mcp-central-docs/projects/gestating-chains/medium-chains.md, which also carries the original Postshot/gsplat/Nerfstudio engine-choice discussion this scaffold deliberately did not resolve.
+
+## Engine selection — DECIDED 2026-07-13: Nerfstudio
+
+Three candidates were compared 2026-07-13 (see README.md for the full table). Postshot was scratched entirely: its CLI, the only tier with genuine automation value, turned out to be a paid Studio-tier feature (~40 pcm) despite the app itself downloading for free — a free-download/paid-CLI split that reads as bait-and-switch regardless of the underlying business reason, and on top of that its GUI-first design and lack of any collider mesh export made it a weak automation fit even before the pricing issue surfaced. gsplat was ruled out as a bare library with no CLI and too much required glue code (SfM, export, everything DIY). Nerfstudio wins on: genuinely free (Apache-2.0, no license gate of any kind), a real designed CLI (ns-process-data, ns-train, ns-export, ns-render) suited to subprocess wrapping, fully Python (fits the fleet's uv-first tooling with zero extra glue), and a PSNR quality gap versus the alternatives that every source checked called barely perceptible.
+
+Load-bearing finding regardless of which engine would have won: none of the three produce a collider mesh as a clean sidecar the way worldlabs-mcp does - blender-mcp's blender_splatting collision-mesh generation is a mandatory pipeline stage for Nerfstudio's output, not an edge-case fallback.

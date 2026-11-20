@@ -1,0 +1,52 @@
+# TOOLS — splatmaker-mcp
+
+## MCP tools (stdio + HTTP `/mcp`)
+
+### `splat_generate(operation, video_path?, image_paths?, job_id?)`
+
+Portmanteau. `operation` is one of:
+
+- `from_video` — start a job from a local video file. Requires `video_path`. Returns immediately with `status: "queued"`; the `ns-process-data → ns-train → ns-export` pipeline runs in the background. Poll with `status`.
+- `from_images` — start a job from image files. Requires `image_paths`. A single directory is passed straight through; scattered files from multiple directories are staged into a temp dir first.
+- `status` — one job's status/message. Requires `job_id`.
+- `list` — all known jobs (persisted in SQLite, survives restart).
+- `get_asset` — asset paths (`ply`, `config`, `job_dir`) for a `done` job. Requires `job_id`.
+
+All returns carry `success` + `message`; failures also carry `error`.
+
+### `splat_engine_status()`
+
+`{success, engine, configured, verified, engine_version, engine_error, max_iterations, note, message}`. `configured` is the fast exe check; `verified` is the cached `ns-train --help` truth (`pending` until the background probe lands, then `ok`/`broken`/`missing`).
+
+### `server_shutdown()`
+
+`{success, status: "shutting_down", message}`. Same implementation as `POST /api/shutdown`.
+
+### `show_status_card()`
+
+`@mcp.tool(app=True)` Prefab card: engine state + job counts by status as a rich card for Prefab-capable hosts. Plain-text `content` mirrors the card numbers; `structured_content` carries the `PrefabApp` view.
+
+## Prompt + resource
+
+- Prompt `splat_workflow` — guided capture → generate → poll → fetch → collider-mesh briefing.
+- Resource `splatmaker://jobs` — live job ledger JSON (same rows as `GET /api/jobs`).
+
+## REST (backend :11091)
+
+| Method + path | Purpose |
+|---|---|
+| `GET /api/health` | Liveness probe for `start.ps1` / frontend dot. |
+| `GET /api/status` | Tool list, job counts by status, uptime. |
+| `GET /api/capabilities` | Machine-readable tool catalog + REST routes + ports. |
+| `GET /api/jobs` | All jobs. |
+| `POST /api/jobs/status` | Body `{"job_id": ...}` → status/message. |
+| `GET /api/skills` | Prompt text (`splat_workflow`) + resource descriptor for the Skills page. |
+| `GET /api/logs` | In-memory log ring (`?limit`, max 500) for the Logs page. |
+| `GET /api/llm/models` | Completion-capable local Ollama models for the Chat page. |
+| `POST /api/llm/chat` | Body `{"model", "messages": [{role, content}], "system"?}` → Ollama `/api/chat` (non-streaming). 502 when Ollama is down. |
+| `GET /api/v1/request-log` | In-memory ring (method, path, origin, client, timestamp, status) + `count` — ground-truth oracle for CUA backend-receipt proof. |
+| `POST /api/shutdown` | Orderly exit (responds 200, exits ~500ms later). |
+
+## Downstream note (load-bearing)
+
+None of the FOSS engines emit a collision mesh. Every splat consumed by Blender/Resonite/VRChat MUST be routed through `blender-mcp`'s `blender_splatting` collision-mesh stage first. Skipping it yields a correct-looking render with no floor.

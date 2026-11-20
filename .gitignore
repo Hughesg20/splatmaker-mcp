@@ -1,0 +1,32 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+node_modules/
+dist/
+*.egg-info/
+.env
+webapp/dist/
+webapp/node_modules/
+*.bak
+boot.log
+boot_err.log
+*.log
+
+# assess + packaging artifacts (regenerable, never commit)
+/reports/
+cua-reports/
+*.mcpb
+mcpb/src/
+native/target/
+native/gen/
+build/
+.coverage
+.pytest_cache/
+__pycache__/
+*.pyc
+*.pyo
+
+# webapp pack artifact
+webapp/*.tgz
