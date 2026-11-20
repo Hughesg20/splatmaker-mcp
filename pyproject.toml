@@ -32,14 +32,27 @@ engine = [
     # DECIDED 2026-07-13 (see README.md "Engine status"): Nerfstudio over
     # bare gsplat (too much DIY glue) and Postshot (scratched - paid CLI
     # behind a free download, bait-and-switch shaped).
-    "torch>=2.4",
-    "torchvision",
-    "nerfstudio>=1.1",
+    # CUDA-only stack: no macOS wheels exist, so gate to Linux/Windows.
+    "torch>=2.4; sys_platform != 'darwin'",
+    "torchvision; sys_platform != 'darwin'",
+    "nerfstudio>=1.1; sys_platform != 'darwin'",
+]
+mps = [
+    # macOS Apple Silicon engine (SPLATMAKER_ENGINE=mps): metalsplat is a
+    # gsplat-equivalent rasterizer with hand-written Metal kernels, trains on
+    # the torch `mps` backend. Apple Silicon only (MPS), so the dependency
+    # itself is darwin-gated. Path source set in tool.uv.sources below; swap
+    # for a published sdist/wheel when metalsplat ships one.
+    "metalsplat; sys_platform == 'darwin'",
 ]
 
 [tool.uv.sources]
-torch = { index = "pytorch-cu124" }
-torchvision = { index = "pytorch-cu124" }
+# cu124 index only publishes Linux/Windows wheels; on macOS resolve torch
+# (with MPS) from PyPI instead.
+torch = { index = "pytorch-cu124", marker = "sys_platform != 'darwin'" }
+torchvision = { index = "pytorch-cu124", marker = "sys_platform != 'darwin'" }
+# metalsplat is only resolvable on macOS (MPS backend); local path clone.
+metalsplat = { path = "/Users/griffyj/Desktop/Mcp/metalsplat-main", marker = "sys_platform == 'darwin'" }
 
 [[tool.uv.index]]
 name = "pytorch-cu124"

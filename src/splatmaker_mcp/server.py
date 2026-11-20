@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json as _json
 import logging
+import os
 import shutil
 import sqlite3 as _sqlite
 import subprocess
@@ -415,6 +416,20 @@ backend = SplatBackend(
 )  # decided 2026-07-13; is_configured() checks the real CLI is present
 
 
+def _make_backend():
+    """Engine selection: SPLATMAKER_ENGINE=mps selects the Metal/MPS backend
+    (macOS Apple Silicon, metalsplat); anything else keeps Nerfstudio."""
+    engine = os.environ.get("SPLATMAKER_ENGINE", "nerfstudio").lower()
+    if engine == "mps":
+        from .mps_backend import MpsBackend
+
+        return MpsBackend()
+    return backend
+
+
+active_backend = _make_backend()
+
+
 # ---------------------------------------------------------------------------
 # Engine truth - exe-present is NOT sufficient (2026-11-01: ns-train.exe
 # existed while the CLI crashed on missing modules, so
@@ -650,7 +665,7 @@ async def splat_generate(
         job = Job(id=jid, kind="from_video", status="queued", created_at=time.time())
         _jobs[jid] = job
         _save_job(job)
-        asyncio.create_task(_run_job(job, backend.generate_from_video(video_path, jid)))
+        asyncio.create_task(_run_job(job, active_backend.generate_from_video(video_path, jid)))
         return {
             "success": True,
             "job_id": jid,
@@ -669,7 +684,7 @@ async def splat_generate(
         job = Job(id=jid, kind="from_images", status="queued", created_at=time.time())
         _jobs[jid] = job
         _save_job(job)
-        asyncio.create_task(_run_job(job, backend.generate_from_images(image_paths, jid)))
+        asyncio.create_task(_run_job(job, active_backend.generate_from_images(image_paths, jid)))
         return {
             "success": True,
             "job_id": jid,
@@ -739,7 +754,26 @@ async def splat_engine_status(ctx: Context) -> dict:
     `splat_engine_status()` -> `{"success": True, "engine": "nerfstudio",
     "configured": True, "max_iterations": 15000, "note": ..., "message": ...}`
     """
-    configured = backend.is_configured()
+    configured = active_backend.is_configured()
+    if active_backend.engine == "mps":
+        note = (
+            "mps engine not ready: torch missing or MPS unavailable - run "
+            "`uv sync --extra mps` on Apple Silicon."
+            if not configured
+            else "metalsplat/MPS engine ready (macOS Apple Silicon); pipeline: "
+            "pycolmap SfM -> metalsplat 3DGS on mps -> .ply export."
+        )
+        return {
+            "success": True,
+            "engine": "mps",
+            "configured": configured,
+            "verified": "ok" if configured else "missing",
+            "engine_version": "",
+            "engine_error": "" if configured else "torch.mps not available",
+            "max_iterations": active_backend.max_iterations,
+            "note": note,
+            "message": note,
+        }
     state = ensure_engine_check()
     note = (
         "engine CLIs not all found (need ns-train + ns-process-data on PATH "
@@ -753,12 +787,12 @@ async def splat_engine_status(ctx: Context) -> dict:
     )
     return {
         "success": True,
-        "engine": backend.engine.value,
+        "engine": active_backend.engine if active_backend.engine != "mps" else "mps",
         "configured": configured,
         "verified": state["status"],
         "engine_version": state["version"],
         "engine_error": state["error"],
-        "max_iterations": backend.max_iterations,
+        "max_iterations": active_backend.max_iterations,
         "note": note,
         "message": note,
     }
@@ -806,7 +840,7 @@ def health_payload() -> dict:
         "server": SERVER_ID,
         "version": SERVER_VERSION,
         "uptime_seconds": round(time.monotonic() - _start_time, 1),
-        "engine_configured": backend.is_configured(),
+        "engine_configured": active_backend.is_configured(),
     }
 
 
@@ -892,7 +926,7 @@ async def show_status_card(ctx: Context) -> ToolResult:
         Separator()
         with Grid(columns=3, gap=3):
             for label, value in [
-                ("Engine", backend.engine.value),
+                ("Engine", active_backend.engine if active_backend.engine != "mps" else "mps"),
                 (
                     "Engine ready",
                     "yes" if h["engine_configured"] else "no (uv sync --extra engine)",
@@ -907,7 +941,7 @@ async def show_status_card(ctx: Context) -> ToolResult:
                     Heading(value)
 
     text = (
-        f"Splatmaker status: engine={backend.engine.value} "
+        f"Splatmaker status: engine={active_backend.engine} "
         f"(configured={h['engine_configured']}, verified={state['status']}"
         + (f" {state['version']}" if state["version"] else "")
         + (f" - {state['error']}" if state["error"] else "")
