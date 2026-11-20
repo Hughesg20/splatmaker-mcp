@@ -115,32 +115,98 @@ class MpsBackend:
         return await asyncio.to_thread(work)
 
     def _map_scene(self, scene_dir: Path) -> None:
-        """COLMAP incremental mapping via pycolmap into scene_dir/sparse/0."""
+        """COLMAP incremental mapping via pycolmap into scene_dir/sparse/0.
+
+        Notes from getting this to work with pycolmap 4.3 (COLMAP 4.3.0.dev0):
+        - the database file must exist first (Database.open creates it);
+          import_images/extract_features/match_* all hard-fail otherwise.
+        - all images are assigned to ONE shared PINHOLE camera (f=960, 800x600)
+          via camera_mode=SINGLE + a camera overwrite; with AUTO's per-image
+          SIMPLE_RADIAL cameras the initial-pair triangulation kept failing
+          ("Provided pair is unsuitable") because mixed image aspect ratios
+          (some review photos are portrait) skewed the shared-focal estimate.
+        - mapper init/registration thresholds are relaxed well below COLMAP
+          defaults (init_min_num_inliers 100/tri 16 deg -> 8/0.5) because the
+          photos are small (370-800px) review shots, not DSLR captures.
+        - the initial pair is forced to the strongest verified pair from
+          read_two_view_geometries() (id packing is uint64: id1<<32|id2,
+          masked to 31 bits).
+        """
         import pycolmap
 
         db = scene_dir / "database.db"
         sparse = scene_dir / "sparse"
         sparse.mkdir(parents=True, exist_ok=True)
-        pycolmap.incremental_mapping(
-            str(db), str(scene_dir / "images"), str(sparse)
+        images = scene_dir / "images"
+        pycolmap.Database.open(str(db))
+        pycolmap.import_images(str(db), str(images), camera_mode=pycolmap.CameraMode.SINGLE)
+        # normalize the single shared camera to PINHOLE 960/960/400/300
+        import numpy as np
+
+        d = pycolmap.Database.open(str(db))
+        d.update_camera(
+            pycolmap.Camera.create_from_model_id(
+                1, pycolmap.CameraModelId.PINHOLE, 960.0, 800, 600
+            )
         )
-        # pycolmap writes sparse/0, sparse/1... keep the largest as sparse/0
-        recons = list(sparse.glob("*"))
+        d.close()
+        pycolmap.extract_features(str(db), str(images))
+        pycolmap.match_exhaustive(str(db))
+        d2 = pycolmap.Database.open(str(db))
+        ids, geoms = d2.read_two_view_geometries()
+        d2.close()
+
+        opts = pycolmap.IncrementalPipelineOptions()
+        opts.min_num_matches = 8
+        opts.min_model_size = 1
+        opts.max_num_models = 1
+        opts.multiple_models = False
+        opts.init_num_trials = 500
+        opts.triangulation.min_angle = 0.5
+        mo = opts.mapper
+        mo.init_min_num_inliers = 8
+        mo.init_min_tri_angle = 0.5
+        mo.init_max_error = 10.0
+        mo.init_max_forward_motion = 1.0
+        mo.init_max_reg_trials = 10
+        mo.abs_pose_min_num_inliers = 8
+        mo.abs_pose_min_inlier_ratio = 0.05
+        mo.abs_pose_max_error = 10.0
+        mo.filter_min_tri_angle = 0.5
+        mo.filter_max_reproj_error = 10.0
+        # Try each of the top verified pairs as the forced initial pair —
+        # which pair initializes successfully is data-dependent (observed:
+        # the strongest pair often fails, weaker ones succeed), so iterate.
+        rows = []
+        for pid, g in zip(ids, geoms):
+            if g is None or g.inlier_matches is None:
+                continue
+            u = pid & 0xFFFFFFFFFFFFFFFF
+            rows.append((len(g.inlier_matches), (u >> 32) & 0x7FFFFFFF, u & 0x7FFFFFFF))
+        rows.sort(reverse=True)
+        recons = {}
+        for _n, id1, id2 in rows[:8]:
+            opts.init_image_id1 = id1
+            opts.init_image_id2 = id2
+            trial = pycolmap.incremental_mapping(
+                str(db), str(images), str(sparse), options=opts
+            )
+            if trial:
+                recons = trial
+                logger.info("colmap init succeeded on pair %d-%d", id1, id2)
+                break
         if not recons:
-            raise RuntimeError("COLMAP produced no reconstruction (sparse/ is empty)")
-        best = max(recons, key=lambda p: len(list(p.glob("*.bin"))))
-        if best.name != "0":
-            target = sparse / "0"
-            if target.exists():
-                shutil.rmtree(target)
-            shutil.move(str(best), str(target))
-        rec = pycolmap.Reconstruction(str(sparse / "0"))
-        n = len(rec.images)
+            raise RuntimeError("COLMAP produced no reconstruction (no viable initial pair)")
+        best = max(recons.values(), key=lambda r: r.num_images())
+        target = sparse / "0"
+        target.mkdir(parents=True, exist_ok=True)  # Reconstruction.write requires the dir to exist
+        best.write(str(target))  # writes cameras/images/points3D .bin files
+        n = best.num_images()
         if n < 3:
             raise RuntimeError(
                 f"COLMAP registered only {n} images — need at least 3 with overlap"
             )
-        logger.info("colmap registered %d images, %d points", n, len(rec.points3D))
+        logger.info("colmap registered %d images, %d points", n, best.num_points3D())
 
     def _train_sync(self, scene_dir: Path, job_dir: Path, source: str):
         from .server import EngineResult
@@ -183,6 +249,7 @@ class MpsBackend:
         train_cameras = [scene.cameras[i] for i in train_idx]
 
         scene_scale = estimate_scene_scale(scene.points)
+        scene_scale = max(scene_scale, 1e-6)  # degenerate point cloud guard
         init_scale = calibrate_initial_scale(scene.points, train_cameras, scene_scale)
         n_points = scene.points.shape[0]
         model = GaussianModel(
