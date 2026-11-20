@@ -30,3 +30,4 @@ __pycache__/
 
 # webapp pack artifact
 webapp/*.tgz
+.DS_Store
