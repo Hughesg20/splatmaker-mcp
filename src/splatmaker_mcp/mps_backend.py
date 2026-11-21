@@ -44,6 +44,9 @@ class MpsBackend:
         )
         self._work_root = Path.home() / ".splatmaker-mcp" / "jobs"
         self._work_root.mkdir(parents=True, exist_ok=True)
+        # When the images dir already contains a COLMAP model (sparse/0/*.bin
+        # next to the images), skip our own SfM and load it directly.
+        self._precomputed_sparse: Path | None = None
 
     def is_configured(self) -> bool:
         try:
@@ -108,6 +111,14 @@ class MpsBackend:
         (scene_dir / "images").mkdir(parents=True, exist_ok=True)
         for f in Path(image_dir).glob("*"):
             shutil.copy2(f, scene_dir / "images" / f.name)
+        # Pre-computed COLMAP model shipped alongside the images?
+        for cand in (Path(image_dir).parent / "sparse" / "0", Path(image_dir) / "sparse" / "0"):
+            if cand.exists() and (cand / "cameras.bin").exists():
+                sparse_dst = scene_dir / "sparse"
+                sparse_dst.mkdir(parents=True, exist_ok=True)
+                shutil.copytree(cand, sparse_dst / "0", dirs_exist_ok=True)
+                logger.info("using pre-computed COLMAP model at %s", cand)
+                break
 
         def work() -> EngineResult:
             return self._train_sync(scene_dir, job_dir, source)
@@ -235,7 +246,10 @@ class MpsBackend:
         device = "mps"
         num_iters = self.max_iterations
         try:
-            self._map_scene(scene_dir)
+            if (scene_dir / "sparse" / "0" / "cameras.bin").exists():
+                logger.info("skipping SfM: pre-computed COLMAP model present")
+            else:
+                self._map_scene(scene_dir)
             scene = load_colmap_scene(scene_dir, device=device, downscale=2.0)
         except Exception as exc:
             return EngineResult(ok=False, message=f"COLMAP stage failed: {exc}")
