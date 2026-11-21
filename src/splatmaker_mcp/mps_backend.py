@@ -111,8 +111,14 @@ class MpsBackend:
         (scene_dir / "images").mkdir(parents=True, exist_ok=True)
         for f in Path(image_dir).glob("*"):
             shutil.copy2(f, scene_dir / "images" / f.name)
-        # Pre-computed COLMAP model shipped alongside the images?
-        for cand in (Path(image_dir).parent / "sparse" / "0", Path(image_dir) / "sparse" / "0"):
+        # Pre-computed COLMAP model shipped alongside the images? Accept it in
+        # the images dir itself, its parent (scene layout: images/ + sparse/),
+        # or any ancestor up to 3 levels (datasets nest e.g. garden/images_4).
+        img_path = Path(image_dir)
+        cands = [img_path / "sparse" / "0", img_path.parent / "sparse" / "0"]
+        for anc in img_path.parents[:3]:
+            cands.append(anc / "sparse" / "0")
+        for cand in cands:
             if cand.exists() and (cand / "cameras.bin").exists():
                 sparse_dst = scene_dir / "sparse"
                 sparse_dst.mkdir(parents=True, exist_ok=True)
@@ -265,6 +271,18 @@ class MpsBackend:
         scene_scale = estimate_scene_scale(scene.points)
         scene_scale = max(scene_scale, 1e-6)  # degenerate point cloud guard
         init_scale = calibrate_initial_scale(scene.points, train_cameras, scene_scale)
+        if not torch.isfinite(torch.tensor(init_scale)) or init_scale <= 0:
+            # happens when no gaussian projects into any training view
+            # (e.g. hand-entered poses whose frustums miss the seed cloud);
+            # fall back to a fraction of the cloud extent so training starts sane
+            extent = float(
+                (scene.points.max(0).values - scene.points.min(0).values).max()
+            )
+            init_scale = max(extent * 0.01, 1e-4)
+            logger.warning(
+                "calibrate_initial_scale returned %s; using extent-based %s",
+                init_scale, init_scale,
+            )
         n_points = scene.points.shape[0]
         model = GaussianModel(
             scene.points,
